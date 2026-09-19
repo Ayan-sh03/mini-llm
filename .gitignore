@@ -1,0 +1,17 @@
+.venv/
+.venv-hyperbolic/
+assets/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pt
+*.bin
+*.mask
+*.partial/
+.env
+smoke-output/
+overfit-check/
+downloaded/
+cpt/
+*.log
+*.tar.gz

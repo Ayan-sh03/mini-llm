@@ -1,0 +1,16 @@
+torch==2.7.1
+litgpt==0.5.9
+lightning==2.5.2
+pytorch-lightning==2.5.2
+torchmetrics==1.7.4
+transformers==4.53.2
+tokenizers==0.21.2
+datasets==3.6.0
+huggingface-hub==0.33.4
+numpy==1.26.4
+modal==1.1.4
+wandb==0.19.11
+click==8.1.8
+typer==0.16.0
+rich==14.0.0
+pytest==8.4.1
