@@ -77,24 +77,35 @@ def pack_all(base_args: str, count: int, out: str):
     prepare_job.remote("prepare", f"merge --out {out}")
 
 
-@app.function(image=image, cpu=32, memory=32768, timeout=86400, retries=0,
-              max_containers=1, secrets=secrets)
+@app.function(image=image, volumes={"/work": volume}, cpu=32, memory=32768,
+              timeout=86400, retries=0, max_containers=1, secrets=secrets)
 def sft_mix(specs: str):
-    """Pack several SFT sources into one bundle, server-side.
+    """Pack several SFT sources then merge — all inside this ONE container.
 
     specs = "out=<dir>;;<shard args>;;<shard args>;;..." where each shard's args
     are mini.prepare sft flags minus --out/--tokenizer/--seq-len/--field/--split.
-    Runs every shard then merges, so a dropped client cannot interrupt it.
+    Deliberately no nested remote calls: a detached app only keeps the last
+    triggered function alive, so inner .remote() calls get canceled.
     """
+    volume.reload()
+    os.environ["RAYON_NUM_THREADS"] = "32"
+    os.environ["TOKENIZERS_PARALLELISM"] = "true"
     parts = [p.strip() for p in specs.split(";;") if p.strip()]
     out = next(p.split("=", 1)[1] for p in parts if p.startswith("out="))
     shards = [p for p in parts if not p.startswith("out=")]
-    for shard in shards:
-        prepare_job.remote("prepare",
-                           f"sft {shard} --seq-len 1024 --field messages --split train "
-                           f"--tokenizer tokenizer --out {out}")
-    prepare_job.remote("prepare", f"merge --out {out}")
-    print(f"SFT mix complete: {out}", flush=True)
+    try:
+        for shard in shards:
+            print(f"PACK {shard}", flush=True)
+            subprocess.run([sys.executable, "-m", "mini.prepare", "sft",
+                            *shlex.split(shard), "--seq-len", "1024",
+                            "--field", "messages", "--split", "train",
+                            "--tokenizer", "tokenizer", "--out", out],
+                           check=True, cwd="/work")
+        subprocess.run([sys.executable, "-m", "mini.prepare", "merge", "--out", out],
+                       check=True, cwd="/work")
+        print(f"SFT mix complete: {out}", flush=True)
+    finally:
+        volume.commit()
 
 
 @app.local_entrypoint()
