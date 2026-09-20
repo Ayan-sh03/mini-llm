@@ -36,6 +36,9 @@ def main(argv=None):
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--micro-batch", type=int)
     p.add_argument("--overfit-batch", action="store_true", help="Debug only; incompatible with resume, HF uploads")
+    p.add_argument("--total-tokens", type=int,
+                   help="Override the WSD token budget. On --resume this lets you shorten the "
+                        "schedule so the LR can anneal within a smaller compute budget.")
     args = p.parse_args(argv)
     if args.max_seconds <= 0 or args.max_steps < 0:
         p.error("max-seconds must be positive and max-steps nonnegative")
@@ -47,6 +50,8 @@ def main(argv=None):
         t["micro_batch"] = args.micro_batch
     if args.no_compile:
         t["compile"] = False
+    if args.total_tokens:
+        t["total_tokens"] = args.total_tokens
     validate_config(cfg)
     device = torch.device(args.device)
     if device.type == "cuda":
@@ -92,7 +97,12 @@ def main(argv=None):
                 latest = out / read_json(out / "latest.json")["directory"]
                 if latest.resolve() != Path(args.resume).resolve():
                     raise ValueError("To resume an older/different checkpoint, choose a NEW --out directory")
-            if resume_signature(state["config"]) != resume_signature(cfg):
+            old_recipe, new_recipe = resume_signature(state["config"]), resume_signature(cfg)
+            if args.total_tokens:
+                # A deliberate schedule change: the rest of the recipe must still match.
+                old_recipe["train"].pop("total_tokens", None)
+                new_recipe["train"].pop("total_tokens", None)
+            if old_recipe != new_recipe:
                 raise ValueError("Training recipe changed. Resume requires fixed schedule/global batch.")
             if state["readers"].keys() != readers.keys():
                 raise ValueError("Resume needs the same data sources")
