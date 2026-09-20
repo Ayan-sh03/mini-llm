@@ -77,10 +77,37 @@ def pack_all(base_args: str, count: int, out: str):
     prepare_job.remote("prepare", f"merge --out {out}")
 
 
+@app.function(image=image, cpu=32, memory=32768, timeout=86400, retries=0,
+              max_containers=1, secrets=secrets)
+def sft_mix(specs: str):
+    """Pack several SFT sources into one bundle, server-side.
+
+    specs = "out=<dir>;;<shard args>;;<shard args>;;..." where each shard's args
+    are mini.prepare sft flags minus --out/--tokenizer/--seq-len/--field/--split.
+    Runs every shard then merges, so a dropped client cannot interrupt it.
+    """
+    parts = [p.strip() for p in specs.split(";;") if p.strip()]
+    out = next(p.split("=", 1)[1] for p in parts if p.startswith("out="))
+    shards = [p for p in parts if not p.startswith("out=")]
+    for shard in shards:
+        prepare_job.remote("prepare",
+                           f"sft {shard} --seq-len 1024 --field messages --split train "
+                           f"--tokenizer tokenizer --out {out}")
+    prepare_job.remote("prepare", f"merge --out {out}")
+    print(f"SFT mix complete: {out}", flush=True)
+
+
 @app.local_entrypoint()
 def main(task: str = "smoke", args: str = "", spawn: bool = False):
-    if task not in {"smoke", "prepare", "train", "hub", "chat", "assets"}:
-        raise ValueError("task must be smoke, prepare, train, hub, chat, or assets")
+    if task not in {"smoke", "prepare", "train", "hub", "chat", "assets", "sftmix"}:
+        raise ValueError("task must be smoke, prepare, train, hub, chat, assets, or sftmix")
+    if task == "sftmix":
+        if spawn:
+            call = sft_mix.spawn(args)
+            print(f"Spawned SFT mix {call.object_id}", flush=True)
+        else:
+            sft_mix.remote(args)
+        return
     if task == "prepare":
         shards = re.search(r"--shards\s+(\d+)", args)
         if shards:
