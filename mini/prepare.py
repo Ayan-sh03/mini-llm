@@ -126,14 +126,21 @@ def conversation(tok, messages, seq_len):
 
 
 def pack(args):
-    """Assistant-only SFT packing (small corpora; streaming is fine)."""
+    """Assistant-only SFT packing (small corpora; streaming is fine).
+
+    With --tag this writes a shard and a ``manifest.<tag>.json`` part (same
+    scheme as ``fast_pack``) so several sources can be packed separately and
+    combined with ``merge``. Filenames carry the tag prefix, so parts never
+    collide.
+    """
     out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=False)
+    out.mkdir(parents=True, exist_ok=args.tag is not None)
     tok_path = Path(args.tokenizer) / "tokenizer.json"
     tok = Tokenizer.from_file(str(tok_path))
     if tok.get_vocab_size() > 65536:
         raise ValueError("uint16 format only supports vocab <= 65536")
-    writers = {s: Writer(out, s) for s in ("train", "val")}
+    prefix = f"{args.tag}-" if args.tag else ""
+    writers = {s: Writer(out, s, prefix=prefix) for s in ("train", "val")}
     counts = {"train": 0, "val": 0, "skipped": 0}
     seen = set()
     for row in itertools.islice(records(args), args.max_docs):
@@ -160,13 +167,13 @@ def pack(args):
         writer.flush()
     if not all(w.entries for w in writers.values()):
         raise ValueError("Missing train/val data. Increase source sample and retry with a NEW output path.")
-    write_json(out / "manifest.json", {
+    write_json(out / (f"manifest.{args.tag}.json" if args.tag else "manifest.json"), {
         "version": 1, "kind": "sft",
         "seq_len": args.seq_len, "vocab_size": tok.get_vocab_size(),
         "tokenizer_sha256": sha256(tok_path), "counts": counts,
         "source": vars(args), "splits": {k: v.entries for k, v in writers.items()}
     })
-    print(json.dumps(counts))
+    print(json.dumps({**counts, "tag": args.tag}), flush=True)
 
 
 def resolve_revision(args):
