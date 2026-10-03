@@ -12,12 +12,20 @@ ROOT = Path(__file__).resolve().parent
 app = modal.App("ayan-mini-llm")
 volume = modal.Volume.from_name("ayan-mini-llm", create_if_missing=True)
 secrets = []
+GPU = os.environ.get("MINI_GPU", "H100")
+if GPU not in {"H100", "H100!", "H200", "B200"}:
+    raise ValueError("MINI_GPU must be H100, H100!, H200, or B200. "
+                     "B300/B200+ require a separately validated CUDA 13.1+ image.")
 if os.environ.get("MINI_HF_AUTH") == "1":
     secrets.append(modal.Secret.from_name("huggingface"))
 if os.environ.get("MINI_WANDB") == "1":
     secrets.append(modal.Secret.from_name("wandb"))
-image = (modal.Image.debian_slim(python_version="3.11")
-         .pip_install_from_requirements(str(ROOT / "requirements.txt"))
+image = modal.Image.debian_slim(python_version="3.11")
+if GPU == "B200":
+    # PyTorch 2.7 Blackwell support requires its CUDA 12.8 build. Installing
+    # first lets requirements.txt keep the exact torch/LitGPT version pins.
+    image = image.pip_install("torch==2.7.1", index_url="https://download.pytorch.org/whl/cu128")
+image = (image.pip_install_from_requirements(str(ROOT / "requirements.txt"))
          .env({"PYTHONPATH": "/project", "HF_HOME": "/work/hf-cache",
                "TOKENIZERS_PARALLELISM": "true", "OMP_NUM_THREADS": "4",
                "MINI_MODAL_VOLUME": "ayan-mini-llm",
@@ -52,7 +60,7 @@ def prepare_job(task: str, args: str):
     execute(task, args)
 
 
-@app.function(image=image, volumes={"/work": volume}, gpu="H100", cpu=4,
+@app.function(image=image, volumes={"/work": volume}, gpu=GPU, cpu=4,
               memory=16384, timeout=86400, retries=0, max_containers=1, secrets=secrets)
 def gpu_job(task: str, args: str):
     execute(task, args)
@@ -110,8 +118,8 @@ def sft_mix(specs: str):
 
 @app.local_entrypoint()
 def main(task: str = "smoke", args: str = "", spawn: bool = False):
-    if task not in {"smoke", "prepare", "train", "hub", "chat", "assets", "sftmix"}:
-        raise ValueError("task must be smoke, prepare, train, hub, chat, assets, or sftmix")
+    if task not in {"smoke", "prepare", "train", "benchmark", "hub", "chat", "assets", "sftmix"}:
+        raise ValueError("task must be smoke, prepare, train, benchmark, hub, chat, assets, or sftmix")
     if task == "sftmix":
         if spawn:
             call = sft_mix.spawn(args)
@@ -137,7 +145,7 @@ def main(task: str = "smoke", args: str = "", spawn: bool = False):
             else:
                 pack_all.remote(base, count, out.group(1))
             return
-    function = gpu_job if task == "train" else (prepare_job if task == "prepare" else cpu_job)
+    function = gpu_job if task in {"train", "benchmark"} else (prepare_job if task == "prepare" else cpu_job)
     if spawn:
         call = function.spawn(task, args)
         print(f"Spawned {task} call {call.object_id} (app stays up while detached).",

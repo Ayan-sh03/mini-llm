@@ -3,7 +3,7 @@ import argparse
 from pathlib import Path
 
 
-def upload(folder, repo, prefix="pretrain"):
+def upload(folder, repo, prefix="pretrain", allow_public=False):
     from huggingface_hub import HfApi
     folder = Path(folder)
     if not prefix or Path(prefix).is_absolute() or ".." in Path(prefix).parts:
@@ -12,8 +12,10 @@ def upload(folder, repo, prefix="pretrain"):
         raise ValueError("Refusing to upload unfinished checkpoint")
     api = HfApi()
     api.create_repo(repo_id=repo, repo_type="model", private=True, exist_ok=True)
-    if not api.model_info(repo).private:
-        raise ValueError("Checkpoint repo must be private; refusing public upload")
+    if not api.model_info(repo).private and not allow_public:
+        raise ValueError(
+            "Checkpoint repo is public. These folders carry optimizer, RNG and reader state, "
+            "so publishing them is opt-in: pass allow_public=True (--allow-public).")
     api.upload_folder(repo_id=repo, folder_path=str(folder),
                       path_in_repo=f"{prefix}/{folder.name}",
                       commit_message=f"Complete {prefix} checkpoint {folder.name}")
@@ -29,11 +31,14 @@ def main():
     p.add_argument("--checkpoint", help="e.g. pretrain/step-00000100")
     p.add_argument("--out", default="downloaded")
     p.add_argument("--revision", help="Optional HF commit ID")
+    p.add_argument("--allow-public", action="store_true",
+                   help="Permit uploading training checkpoints to a public repo "
+                        "(they contain optimizer, RNG and reader state)")
     args = p.parse_args()
     if args.command == "upload":
         if not args.folder:
             p.error("--folder required")
-        upload(args.folder, args.repo, args.prefix)
+        upload(args.folder, args.repo, args.prefix, args.allow_public)
     else:
         if not args.checkpoint or Path(args.checkpoint).is_absolute() or ".." in Path(args.checkpoint).parts:
             p.error("--checkpoint must be an explicit repo-relative checkpoint folder")

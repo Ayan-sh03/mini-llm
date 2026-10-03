@@ -1,5 +1,8 @@
 # Scratch 123M: a portable learning experiment
 
+For the training performance patch, GPU selection, and reproducible A/B benchmarks,
+see [OPTIMIZATION.md](OPTIMIZATION.md).
+
 **Updated budget: $30 Modal + $51 Hyperbolic. Start with [HYPERBOLIC.md](HYPERBOLIC.md)**
 for the revised allocation, H100/RTX PRO 6000 setup and data-transfer commands.
 The older all-Modal walkthrough below remains useful as a reference; its $80 Modal
@@ -106,7 +109,8 @@ modal run modal_app.py --task prepare --args 'pack --tokenizer tokenizer --out p
 This writes about 200MB of training tokens plus validation and small metadata.
 Preparation is not resumable yet: a failed partial output is never mistaken for a
 complete corpus. Use a fresh output directory when retrying. Check the printed counts.
-`--max-docs` also limits the scan; if hit first, fewer than requested tokens may exist.
+`--max-docs` bounds the local JSONL paths (`pack --local`, `sft`). The parquet fast path
+above is bounded by `--max-tokens` and the selected source files, not by `--max-docs`.
 
 ## 5. Benchmark the ACTUAL 123M model for 20 minutes
 
@@ -213,7 +217,8 @@ python -m mini.chat --checkpoint downloaded/sft/step-XXXXXXXX --prompt 'How was 
 ```
 
 Before SFT, omit `--chat` and use a completion prompt such as `Once upon a time`.
-The included inference loop has no KV cache; it is for inspection, not deployment.
+Generation uses the LitGPT KV cache: one forward pass per new token, CPU or GPU. It is
+still an inspection tool, not a deployment server.
 Validation loss + sample chats are included; formal lm-evaluation-harness integration,
 HF Transformers/safetensors export and GGUF export are not included in this starter.
 
@@ -227,6 +232,11 @@ before them. For a short pilot, explicitly upload its first checkpoint on CPU:
 ```bash
 modal run modal_app.py --task hub --args 'upload --repo YOUR_USERNAME/mini-123m-training --folder pilot/step-XXXXXXXX --prefix pilot'
 ```
+
+Uploads refuse a public destination by default, because a checkpoint folder contains
+optimizer, RNG and reader state. Add `--allow-public` (or `allow_public=True`) to publish
+deliberately; training runs take the same flag and report the refusal at launch rather
+than at the final upload.
 
 On a new provider, install the same project/dependencies and authenticate HF with a
 secure environment variable or login. Download an explicit complete folder:

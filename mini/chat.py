@@ -9,7 +9,46 @@ from .engine import amp, build_model, load_checkpoint
 from .prepare import encode_plain
 
 
+def sample_last(logits, args, banned):
+    """Pick one token from the final position of a `(1, T, vocab)` logits tensor."""
+    logits = logits[:, -1, :].float()
+    logits[:, banned] = -float("inf")
+    if args.temperature <= 0:
+        return int(logits.argmax(-1))
+    logits = logits / args.temperature
+    if args.top_k > 0:
+        cut = logits.topk(min(args.top_k, logits.shape[-1])).values[:, -1:]
+        logits[logits < cut] = -float("inf")
+    return int(torch.multinomial(logits.softmax(-1), 1))
+
+
 @torch.no_grad()
+def generate(model, prompt, limit, args, device, stop, banned):
+    """Incremental decode through the LitGPT KV cache: one forward pass per new token.
+
+    The prompt is prefilled once; every later step feeds a single token. Re-running the
+    whole prefix each step made this path quadratic in the output length and unusable as
+    a latency datapoint. Prefill uses positions `0..len(prompt)-1`, and each new token is
+    written at position `len(ids) - 1` with `input_pos_maxp1` covering it.
+    """
+    ids = list(prompt)
+    model.set_kv_cache(batch_size=1, max_seq_length=limit, device=device)
+    chunk = torch.tensor([ids], device=device, dtype=torch.int64)
+    input_pos = torch.arange(len(ids), device=device, dtype=torch.int64)
+    input_pos_maxp1 = len(ids)
+    while len(ids) < limit and len(ids) - len(prompt) < args.max_new_tokens:
+        with amp(device):
+            logits = model(chunk, input_pos, input_pos_maxp1=input_pos_maxp1)
+        token = sample_last(logits, args, banned)
+        if token in stop:
+            break
+        ids.append(token)
+        chunk = torch.tensor([[token]], device=device, dtype=torch.int64)
+        input_pos = torch.tensor([len(ids) - 1], device=device, dtype=torch.int64)
+        input_pos_maxp1 = len(ids)
+    return ids
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", required=True)
@@ -41,21 +80,7 @@ def main():
         if len(ids) >= limit:
             p.error("Prompt fills the context window; shorten it")
         start = len(ids)
-        for _ in range(min(args.max_new_tokens, limit - len(ids))):
-            with amp(device):
-                logits = model(torch.tensor([ids], device=device))[:, -1, :].float()
-            logits[:, banned] = -float("inf")
-            if args.temperature <= 0:
-                token = int(logits.argmax(-1))
-            else:
-                logits /= args.temperature
-                if args.top_k > 0:
-                    cut = logits.topk(min(args.top_k, logits.shape[-1])).values[:, -1:]
-                    logits[logits < cut] = -float("inf")
-                token = int(torch.multinomial(logits.softmax(-1), 1))
-            if token in stop:
-                break
-            ids.append(token)
+        ids = generate(model, ids, limit, args, device, stop, banned)
         if many:
             print(f"\n### {prompt}", flush=True)
             print(prompt + tok.decode(ids[start:]), flush=True)

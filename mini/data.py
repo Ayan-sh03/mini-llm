@@ -16,6 +16,7 @@ class Blocks:
         self.seq_len = seq_len
         self.seed = seed
         self.cursor = 0
+        self._permutation_epoch = None
         self.arrays, self.masks, sizes = [], [], []
         for entry in self.meta["splits"][split]:
             p = self.root / entry["file"]
@@ -45,11 +46,15 @@ class Blocks:
     def permuted(self, index):
         # Affine bijection, not a uniform random permutation; changes each epoch.
         epoch, offset = divmod(index, self.n)
-        rng = np.random.default_rng(self.seed + epoch)
-        a = int(rng.integers(1, max(2, self.n)))
-        while math.gcd(a, self.n) != 1:
-            a = (a + 1) % self.n or 1
-        b = int(rng.integers(self.n))
+        if epoch != self._permutation_epoch:
+            rng = np.random.default_rng(self.seed + epoch)
+            a = int(rng.integers(1, max(2, self.n)))
+            while math.gcd(a, self.n) != 1:
+                a = (a + 1) % self.n or 1
+            b = int(rng.integers(self.n))
+            self._permutation_epoch = epoch
+            self._permutation_ab = a, b
+        a, b = self._permutation_ab
         return (a * offset + b) % self.n
 
     def next_numpy(self, batch):

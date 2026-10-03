@@ -1,3 +1,4 @@
+import gc
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,9 @@ def test_private_mock_transfer_preserves_reader(tmp_path, monkeypatch):
     before.next_numpy(3)
     after.load_state_dict(before.state_dict())
     assert all(np.array_equal(a, b) for a, b in zip(before.next_numpy(2), after.next_numpy(2)))
+    # Windows keeps memory-mapped files locked while a reader is alive; Linux does not.
+    del before, after
+    gc.collect()
     (bundle / "data/train-00000.bin").write_bytes(b"bad")
     with pytest.raises(ValueError, match="Corrupt"):
         verify(bundle)

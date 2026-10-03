@@ -1,12 +1,14 @@
 import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
+from mini.chat import generate
 from mini.common import SPECIAL, holdout, validate_config, wsd, sha256, write_json
 from mini.data import Blocks
 from mini.engine import build_model, make_optimizer, seed_all, update, rng_state, restore_rng
@@ -109,7 +111,9 @@ def test_overfit_and_gradient_accumulation():
     clone = copy.deepcopy(model)
     optimizer = make_optimizer(model, cfg["train"], device)
     other = make_optimizer(clone, cfg["train"], device)
-    x = np.tile(np.arange(1, 17), (4, 1))
+    # dtype matters: numpy defaults to int32 on Windows, but cross_entropy needs int64
+    # targets, exactly as Blocks.next_numpy returns. Without this the test fails on Windows.
+    x = np.tile(np.arange(1, 17, dtype=np.int64), (4, 1))
     y = x + 1
     y[0, 8:] = -100  # uneven supervised-token counts across microbatches
     full = [(x, y)]
@@ -121,6 +125,24 @@ def test_overfit_and_gradient_accumulation():
     for _ in range(24):
         loss = update(model, optimizer, full, 0.003, device, 1.0)[0]
     assert loss < first * 0.5
+
+
+def test_chat_kv_cache_matches_full_recompute():
+    """The cached decoder must emit exactly what recomputing the prefix emits."""
+    cfg = json.loads((ROOT / "configs/tiny.json").read_text())
+    device = torch.device("cpu")
+    seed_all(7)
+    model = build_model(cfg["model"], device)
+    model.eval()
+    prompt, limit, new = [3, 9, 27, 81, 12, 5], 32, 8
+    args = SimpleNamespace(temperature=0.0, top_k=0, max_new_tokens=new)
+    cached = generate(model, prompt, limit, args, device, set(), [])
+    naive = list(prompt)
+    with torch.no_grad():
+        while len(naive) < limit and len(naive) - len(prompt) < new:
+            naive.append(int(model(torch.tensor([naive]))[:, -1, :].argmax(-1)))
+    assert cached == naive
+    assert len(cached) == len(prompt) + new
 
 
 def test_rng_roundtrip():

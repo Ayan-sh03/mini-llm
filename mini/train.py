@@ -13,7 +13,7 @@ from tokenizers import Tokenizer
 
 from .common import read_json, sha256, validate_config, write_json, wsd
 from .data import Blocks
-from .engine import (build_model, evaluate, load_checkpoint, make_optimizer,
+from .engine import (BatchTransfer, build_model, evaluate, load_checkpoint, make_loss, make_optimizer,
                      restore_rng, resume_signature, save_checkpoint, seed_all, update)
 from .hub import upload
 
@@ -33,7 +33,12 @@ def main(argv=None):
     p.add_argument("--max-steps", type=int, default=0, help="Per invocation; 0 means timer/token limit only")
     p.add_argument("--hub-repo")
     p.add_argument("--hub-prefix", default="pretrain")
+    p.add_argument("--allow-public", action="store_true",
+                   help="Permit checkpoint uploads to a public repo (they contain "
+                        "optimizer, RNG and reader state); default refuses")
     p.add_argument("--no-compile", action="store_true")
+    p.add_argument("--compile-mode", choices=["default", "max-autotune-no-cudagraphs"],
+                   help="Compile model AND loss; autotuning increases startup time")
     p.add_argument("--micro-batch", type=int)
     p.add_argument("--overfit-batch", action="store_true", help="Debug only; incompatible with resume, HF uploads")
     p.add_argument("--total-tokens", type=int,
@@ -50,6 +55,8 @@ def main(argv=None):
         t["micro_batch"] = args.micro_batch
     if args.no_compile:
         t["compile"] = False
+    if args.compile_mode:
+        t["compile_mode"] = args.compile_mode
     if args.total_tokens:
         t["total_tokens"] = args.total_tokens
     validate_config(cfg)
@@ -114,7 +121,9 @@ def main(argv=None):
             if state["versions"]["litgpt"] != "0.5.9":
                 raise ValueError("Use the same pinned LitGPT version that wrote this checkpoint")
         # Restore RNG AFTER optional torch.compile creation below.
-    run_model = torch.compile(model) if t["compile"] and device.type == "cuda" else model
+    loss_fn = make_loss(model, compile=t["compile"] and device.type == "cuda",
+                        mode=t.get("compile_mode", "default"))
+    transfer = BatchTransfer(device)
     if args.resume:
         restore_rng(state["rng"])
     if args.resume or args.init:
@@ -180,7 +189,8 @@ def main(argv=None):
                 source = readers["decay" if use_decay else "train"]
                 batches.append(fixed[i] if fixed is not None else source.next_numpy(t["micro_batch"]))
             lr = wsd(progress["tokens"] + batch_tokens, t)
-            loss, grad, supervised = update(run_model, optimizer, batches, lr, device, t["grad_clip"])
+            loss, grad, supervised = update(model, optimizer, batches, lr, device, t["grad_clip"],
+                                            loss_fn=loss_fn, transfer=transfer)
             progress["tokens"] += batch_tokens
             progress["supervised_tokens"] += supervised
             progress["step"] += 1
@@ -198,10 +208,20 @@ def main(argv=None):
                     f.write(json.dumps(metrics) + "\n")
                 window_tokens, window_time = 0, now
             if progress["step"] % t["eval_steps"] == 0:
-                val_loss = evaluate(run_model, val, t["micro_batch"], t["eval_batches"], device)
-                print(json.dumps({"step": progress["step"], "val_loss": val_loss}), flush=True)
+                val_loss = evaluate(model, val, t["micro_batch"], t["eval_batches"], device,
+                                    loss_fn=loss_fn)
+                # Persist validation too: the subset is micro_batch * eval_batches, so a
+                # micro_batch change moves the mean. Record size + data fingerprint to make
+                # before/after comparisons auditable rather than assumed.
+                metrics = {"step": progress["step"], "tokens": progress["tokens"],
+                           "val_loss": val_loss,
+                           "val_blocks": t["micro_batch"] * t["eval_batches"],
+                           "data_fingerprint": val.fingerprint}
+                print(json.dumps(metrics), flush=True)
                 if wb:
                     wb.log({"val_loss": val_loss}, step=progress["step"])
+                with open(out / "metrics.jsonl", "a") as f:
+                    f.write(json.dumps(metrics) + "\n")
             now = time.monotonic()
             due_hub = bool(args.hub_repo and now - last_hub >= t["hub_seconds"])
             if now - last_save >= t["save_seconds"] or due_hub:
@@ -210,14 +230,15 @@ def main(argv=None):
                 if due_hub and (future is None or future.done()):
                     if future:
                         future.result()  # surface failed uploads; don't claim success
-                    future = pool.submit(upload, folder, args.hub_repo, args.hub_prefix)
+                    future = pool.submit(upload, folder, args.hub_repo, args.hub_prefix,
+                                         args.allow_public)
                     last_hub = now
         folder = checkpoint()
         if future:
             future.result()
         # Final synchronous upload confirms durability before reporting success.
         if args.hub_repo and folder:
-            upload(folder, args.hub_repo, args.hub_prefix)
+            upload(folder, args.hub_repo, args.hub_prefix, args.allow_public)
         print(json.dumps({"finished": progress, "checkpoint": str(folder)}), flush=True)
         return folder
     finally:

@@ -1,5 +1,6 @@
 .venv/
 .venv-hyperbolic/
+.venv-test/
 assets/
 __pycache__/
 .pytest_cache/

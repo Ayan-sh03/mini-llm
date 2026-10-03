@@ -1,3 +1,59 @@
+# Validation — 2026-09-20
+
+## Review follow-up: code fixes
+
+Applied against the 2026-09-20 external review, findings A/B/C/E and the public-repo guard:
+
+- `mini/prepare.py` — `pack --local` no longer falls through to `fast_pack()`. The new
+  `pack_local()` writes the same shard/manifest format without importing `datasets` or
+  `huggingface_hub`, so the documented offline smoke path is offline again, and `--max-docs`
+  is honored on that path.
+- `mini/prepare.py` — `merge()` now requires every part to agree on `version`, `kind`,
+  `seq_len`, `vocab_size` and `tokenizer_sha256`; validates each shard's byte length against
+  the declared row layout (an SFT shard must be a whole number of `seq_len + 1` rows with a
+  mask of the same length); refuses to overwrite an existing `manifest.json`; embeds each
+  part's full metadata under `source.provenance`; and retains the part manifests instead of
+  deleting them.
+- `mini/train.py` — validation results are persisted to `metrics.jsonl` with `val_blocks`
+  (the evaluated subset size) and the validation `data_fingerprint`, so a micro-batch change
+  can no longer silently shift what a val curve means.
+- `mini/chat.py` — generation uses the LitGPT KV cache (one prefill plus one forward pass per
+  new token) instead of recomputing the entire prefix at every step.
+- `mini/hub.py`, `mini/train.py` — uploading checkpoints to a public repo is now an explicit
+  opt-in (`--allow-public`); the default still refuses, and a training run surfaces the
+  refusal at launch rather than at the final upload.
+
+Verification:
+
+- `python -m pytest -q`: **19 passed** (was 12). Added 6 merge/local-pack tests and 1 test
+  asserting that KV-cached decoding emits exactly the same tokens as full-prefix recompute.
+- `python -m mini.smoke`: **passed** with `HF_HUB_OFFLINE=1` and `HF_DATASETS_OFFLINE=1` set,
+  so any accidental Hub access would have raised. It also asserts that a `val_loss` record
+  reached `metrics.jsonl` with its subset size.
+- Two **pre-existing, Windows-only** test failures were repaired in the tests, not the
+  library: `np.arange` defaults to `int32` on Windows while `cross_entropy` requires `int64`
+  targets, and `np.memmap` keeps a shard locked on Windows so the corruption test could not
+  overwrite a live file. Both tests pass unmodified on Linux.
+- Environment here: Windows, Python 3.12.8, PyTorch 2.7.1+cpu, LitGPT 0.5.9, NumPy 1.26.4.
+  GPU paths (BF16, `torch.compile`, CUDA fused AdamW) remain unexercised in this pass.
+  The throwaway test environment is the gitignored `.venv-test/` on the project drive:
+
+  ```bash
+  uv venv .venv-test --python 3.12.8
+  uv pip install --python .venv-test/Scripts/python.exe torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+  uv pip install --python .venv-test/Scripts/python.exe litgpt==0.5.9 tokenizers==0.21.2 \
+    numpy==1.26.4 huggingface-hub==0.33.4 pytest==8.4.1 datasets==3.6.0
+  .venv-test/Scripts/python.exe -m pytest tests -q
+  ```
+
+Still open from the same review: microbatch-dependent decay-source sampling (D), SFT
+padding/logit-cost utilization (F), cross-source and near-duplicate dedup, holdout vs
+contamination checks, and the historical `train2-manifest.json`, whose source revisions were
+destroyed by the old `merge` and cannot be restored by a code change.
+
+The "offline smoke test passed" claim in the 2026-09-19 note was stale when it was written
+against the later `prepare` dispatch; it is accurate again as of this date.
+
 # Validation — 2026-09-19
 
 ## Hyperbolic update

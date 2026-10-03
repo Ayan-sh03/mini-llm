@@ -7,6 +7,7 @@ import random
 import shutil
 import sys
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -61,7 +62,41 @@ def loss_sum(model, x, y):
                            y.reshape(-1), ignore_index=-100, reduction="sum")
 
 
-def update(model, optimizer, batches, lr, device, grad_clip):
+def make_loss(model, compile=False, mode="default"):
+    # Compile through FP32 cross entropy, rather than returning the very large
+    # vocabulary logits to an eager loss. Keep FP32 loss arithmetic unchanged.
+    fn = partial(loss_sum, model)
+    return torch.compile(fn, mode=mode) if compile else fn
+
+
+class BatchTransfer:
+    """Reusable pinned buffers for one optimizer update; no lookahead/cursor changes.
+
+    The caller must finish its update before reusing this object's host buffers.
+    update() synchronizes when returning its metrics, so reuse is safe there.
+    """
+    def __init__(self, device):
+        self.device = device
+        self.host = None
+
+    def __call__(self, batches):
+        if self.device.type != "cuda":
+            return [(torch.from_numpy(x), torch.from_numpy(y)) for x, y in batches]
+        sizes = [x.shape[0] for x, _ in batches]
+        shape = (2, sum(sizes), batches[0][0].shape[1])
+        if self.host is None or tuple(self.host.shape) != shape:
+            self.host = torch.empty(shape, dtype=torch.int64, pin_memory=True)
+        offset = 0
+        for (x, y), size in zip(batches, sizes):
+            self.host[0, offset:offset + size].copy_(torch.from_numpy(x))
+            self.host[1, offset:offset + size].copy_(torch.from_numpy(y))
+            offset += size
+        # One asynchronous copy instead of two blocking copies per microbatch.
+        packed = self.host.to(self.device, non_blocking=True)
+        return list(zip(packed[0].split(sizes), packed[1].split(sizes)))
+
+
+def update(model, optimizer, batches, lr, device, grad_clip, *, loss_fn=None, transfer=None):
     # Normalize across ALL supervised tokens of the update, including SFT padding.
     count = sum(int((y != -100).sum()) for _, y in batches)
     if count == 0:
@@ -69,36 +104,40 @@ def update(model, optimizer, batches, lr, device, grad_clip):
     optimizer.zero_grad(set_to_none=True)
     for group in optimizer.param_groups:
         group["lr"] = lr
-    total_loss = 0.0
-    for x, y in batches:
-        x = torch.from_numpy(x).to(device)
-        y = torch.from_numpy(y).to(device)
+    if transfer is None:
+        transfer = BatchTransfer(device)
+    loss_fn = loss_fn or partial(loss_sum, model)
+    total_loss = torch.zeros((), dtype=torch.float64, device=device)
+    for x, y in transfer(batches):
         with amp(device):
-            loss = loss_sum(model, x, y)
+            loss = loss_fn(x, y)
         (loss / count).backward()
-        total_loss += float(loss.detach())
+        # Converting to a Python float here stalled CUDA on EVERY microbatch.
+        total_loss.add_(loss.detach().to(torch.float64))
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip, error_if_nonfinite=True)
     optimizer.step()
-    return total_loss / count, float(norm), count
+    return float(total_loss / count), float(norm), count
 
 
 @torch.no_grad()
-def evaluate(model, reader, micro_batch, batches, device):
+def evaluate(model, reader, micro_batch, batches, device, loss_fn=None):
     state = reader.state_dict()
     reader.cursor = 0  # identical validation subset at every evaluation
     was_training = model.training
     model.eval()
-    loss, count = 0.0, 0
+    loss, count = torch.zeros((), dtype=torch.float64, device=device), 0
+    loss_fn = loss_fn or partial(loss_sum, model)
     try:
         for _ in range(batches):
             x, y = reader.next_numpy(micro_batch)
             count += int((y != -100).sum())
             with amp(device):
-                loss += float(loss_sum(model, torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)))
+                loss.add_(loss_fn(torch.from_numpy(x).to(device),
+                                  torch.from_numpy(y).to(device)).to(torch.float64))
     finally:
         reader.load_state_dict(state)
         model.train(was_training)
-    return loss / max(1, count)
+    return float(loss / max(1, count))
 
 
 def rng_state():
@@ -126,7 +165,7 @@ def versions():
 
 def resume_signature(config):
     c = copy.deepcopy(config)
-    for key in ("micro_batch", "compile", "eval_steps", "eval_batches", "save_seconds", "hub_seconds", "log_steps"):
+    for key in ("micro_batch", "compile", "compile_mode", "eval_steps", "eval_batches", "save_seconds", "hub_seconds", "log_steps"):
         c["train"].pop(key, None)
     return c
 

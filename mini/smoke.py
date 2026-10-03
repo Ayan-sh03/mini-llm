@@ -20,6 +20,7 @@ def run(root):
     root.mkdir(parents=True, exist_ok=True)
     cfg = read_json(project / "configs/tiny.json")
     cfg["model"]["vocab_size"] = 384
+    cfg["train"]["eval_steps"] = 2  # exercise validation logging inside this short run
     config_path = root / "tiny.json"
     write_json(config_path, cfg)
     source = root / "toy.jsonl"
@@ -51,6 +52,12 @@ def run(root):
             assert torch.equal(tensor, b["optimizer"]["state"][key][field]), (key, field)
     assert torch.equal(a["rng"]["torch"], b["rng"]["torch"])
     print("PASS: uninterrupted vs fresh-process resumed CPU training is bitwise equal.", flush=True)
+    with open(root / "continuous/metrics.jsonl", encoding="utf-8") as f:
+        records = [json.loads(line) for line in f]
+    subset = cfg["train"]["micro_batch"] * cfg["train"]["eval_batches"]
+    assert any(r.get("val_blocks") == subset and "val_loss" in r for r in records), \
+        "validation was not persisted to metrics.jsonl with its subset size"
+    print("PASS: validation loss persisted to metrics.jsonl.", flush=True)
     # Prepare complete short chats and run a fresh assistant-only SFT optimizer.
     chats = root / "chats.jsonl"
     with open(chats, "w") as f:

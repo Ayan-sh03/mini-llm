@@ -125,6 +125,54 @@ def conversation(tok, messages, seq_len):
     return ids + [tok.token_to_id("<|pad|>")] * padding, mask + [0] * padding
 
 
+def finish_manifest(out, args, tok_path, vocab_size, writers, counts, kind):
+    for writer in writers.values():
+        writer.flush()
+    if not all(w.entries for w in writers.values()):
+        raise ValueError("Missing train/val data. Increase source sample and retry with a NEW output path.")
+    write_json(out / (f"manifest.{args.tag}.json" if args.tag else "manifest.json"), {
+        "version": 1, "kind": kind,
+        "seq_len": args.seq_len, "vocab_size": vocab_size,
+        "tokenizer_sha256": sha256(tok_path), "counts": counts,
+        "source": vars(args), "splits": {k: v.entries for k, v in writers.items()},
+    })
+
+
+def pack_local(args):
+    """Offline pretraining pack from a local JSONL: no Hub revision, no downloads.
+
+    ``fast_pack`` resolves a Hub revision and streams parquet shards, so ``--local``
+    must never reach it. This path imports neither datasets nor huggingface_hub,
+    which keeps ``mini.smoke`` and toy runs fully offline.
+    """
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=args.shard_count > 1)
+    tok_path = Path(args.tokenizer) / "tokenizer.json"
+    tok = Tokenizer.from_file(str(tok_path))
+    if tok.get_vocab_size() > 65536:
+        raise ValueError("uint16 format only supports vocab <= 65536")
+    prefix = f"{args.tag}-" if args.tag else ""
+    writers = {s: Writer(out, s, limit=args.shard_tokens, prefix=prefix) for s in ("train", "val")}
+    counts = {"train": 0, "val": 0, "skipped": 0}
+    eos_id = tok.token_to_id("<|eos|>")
+    started = time.monotonic()
+    for row in itertools.islice(records(args), args.max_docs):
+        text = row.get(args.field)
+        if not isinstance(text, str) or len(text.strip()) < 100:
+            counts["skipped"] += 1
+            continue
+        split = "val" if holdout(text) else "train"
+        if split == "val" and counts["val"] >= args.val_tokens:
+            continue
+        ids = encode_plain(tok, text) + [eos_id]
+        writers[split].add(ids)
+        counts[split] += len(ids)
+        if counts["train"] >= args.max_tokens and counts["val"] >= args.seq_len + 1:
+            break
+    finish_manifest(out, args, tok_path, tok.get_vocab_size(), writers, counts, "pretrain")
+    print(json.dumps({**counts, "seconds": round(time.monotonic() - started, 1)}), flush=True)
+
+
 def pack(args):
     """Assistant-only SFT packing (small corpora; streaming is fine).
 
@@ -163,16 +211,7 @@ def pack(args):
         counts[split] += 1
         if counts["train"] >= args.max_examples and counts["val"] > 0:
             break
-    for writer in writers.values():
-        writer.flush()
-    if not all(w.entries for w in writers.values()):
-        raise ValueError("Missing train/val data. Increase source sample and retry with a NEW output path.")
-    write_json(out / (f"manifest.{args.tag}.json" if args.tag else "manifest.json"), {
-        "version": 1, "kind": "sft",
-        "seq_len": args.seq_len, "vocab_size": tok.get_vocab_size(),
-        "tokenizer_sha256": sha256(tok_path), "counts": counts,
-        "source": vars(args), "splits": {k: v.entries for k, v in writers.items()}
-    })
+    finish_manifest(out, args, tok_path, tok.get_vocab_size(), writers, counts, "sft")
     print(json.dumps({**counts, "tag": args.tag}), flush=True)
 
 
@@ -246,6 +285,8 @@ def pack_file(path, tok, field, eos_id, writers, counts, args):
 
 def fast_pack(args):
     """Parallel pretraining pack: threaded shard download + batched Rust tokenization."""
+    if args.local:
+        return pack_local(args)  # never resolve/download a remote corpus
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=args.shard_count > 1)
     tok_path = Path(args.tokenizer) / "tokenizer.json"
@@ -299,51 +340,87 @@ def fast_pack(args):
                 pending[pool.submit(download_file, args.dataset, name, args.revision, cache)] = name
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    for writer in writers.values():
-        writer.flush()
-    if not all(w.entries for w in writers.values()):
-        raise ValueError("Missing train/val data. Increase source sample and retry with a NEW output path.")
-    write_json(out / (f"manifest.{args.tag}.json" if args.tag else "manifest.json"), {
-        "version": 1, "kind": "pretrain",
-        "seq_len": args.seq_len, "vocab_size": tok.get_vocab_size(),
-        "tokenizer_sha256": sha256(tok_path), "counts": counts,
-        "source": vars(args), "splits": {k: v.entries for k, v in writers.items()}
-    })
+    finish_manifest(out, args, tok_path, tok.get_vocab_size(), writers, counts, "pretrain")
     print(json.dumps({**counts, "files": len(files),
                       "seconds": round(time.monotonic() - started, 1)}), flush=True)
 
 
+MERGE_FIELDS = ("version", "kind", "seq_len", "vocab_size", "tokenizer_sha256")
+
+
+def shard_rows(root, entry, meta):
+    """Reject a shard whose bytes do not match the declared uint16 row layout."""
+    path = root / entry["file"]
+    if not path.exists():
+        raise ValueError(f"Shard listed in a manifest is absent: {path.name}")
+    size = path.stat().st_size
+    if size % 2:
+        raise ValueError(f"{path.name}: {size} bytes is not a whole number of uint16 tokens")
+    tokens = size // 2
+    if meta["kind"] == "sft":
+        # Without this, two corpora of different sequence length merge when the
+        # row counts happen to divide, silently re-cutting every conversation.
+        row = meta["seq_len"] + 1
+        if tokens % row:
+            raise ValueError(f"{path.name}: {tokens} tokens is not a whole number of {row}-token rows")
+        mask = root / entry.get("mask", "")
+        if not entry.get("mask") or not mask.exists() or mask.stat().st_size != tokens:
+            raise ValueError(f"{path.name}: assistant mask is missing or not {tokens} bytes")
+    return tokens
+
+
 def merge(args):
-    """Combine parallel pack shards (manifest.<tag>.json parts) into manifest.json."""
+    """Combine parallel pack shards (manifest.<tag>.json parts) into manifest.json.
+
+    Every part must agree on the structural fields, and each part's full metadata is
+    embedded under ``source.provenance`` so dataset names, resolved revisions, counts
+    and preparation arguments survive the merge. Part manifests are retained, and a
+    completed manifest.json is never overwritten.
+    """
     out = Path(args.out)
+    merged = out / "manifest.json"
+    if merged.exists():
+        raise ValueError(f"{merged} already exists. Merge into a NEW --out; never mutate a live corpus.")
     parts = sorted(out.glob("manifest.*.json"))
     if not parts:
         raise ValueError(f"No manifest.<tag>.json parts found in {out}")
     base = read_json(parts[0])
+    for field in MERGE_FIELDS:
+        if field not in base:
+            raise ValueError(f"{parts[0].name} is missing {field!r}")
     splits = {k: [] for k in base["splits"]}
     counts = {"train": 0, "val": 0, "skipped": 0}
-    seen = set()
+    seen, provenance = set(), []
     for part in parts:
         meta = read_json(part)
-        if meta["kind"] != base["kind"] or meta["tokenizer_sha256"] != base["tokenizer_sha256"]:
-            raise ValueError(f"Shard {part.name} is not compatible with the others")
+        for field in MERGE_FIELDS:
+            if meta.get(field) != base.get(field):
+                raise ValueError(f"{part.name} disagrees with {parts[0].name} on {field!r}: "
+                                 f"{meta.get(field)!r} != {base.get(field)!r}")
+        if sorted(meta["splits"]) != sorted(base["splits"]):
+            raise ValueError(f"{part.name} declares different splits: {sorted(meta['splits'])}")
         for split, entries in meta["splits"].items():
             for entry in entries:
                 if entry["file"] in seen:
                     raise ValueError(f"Duplicate shard filename across parts: {entry['file']}")
+                shard_rows(out, entry, meta)
                 seen.add(entry["file"])
                 splits[split].append(entry)
         for key in counts:
             counts[key] += meta["counts"].get(key, 0)
-    write_json(out / "manifest.json", {
-        "version": 1, "kind": base["kind"],
+        provenance.append({
+            "manifest": part.name, "manifest_sha256": sha256(part),
+            "kind": meta["kind"], "seq_len": meta["seq_len"],
+            "vocab_size": meta["vocab_size"], "counts": meta["counts"],
+            "source": meta.get("source"),
+        })
+    write_json(merged, {
+        "version": base["version"], "kind": base["kind"],
         "seq_len": base["seq_len"], "vocab_size": base["vocab_size"],
         "tokenizer_sha256": base["tokenizer_sha256"], "counts": counts,
-        "source": {"merged": [p.name for p in parts]},
+        "source": {"merged": [p.name for p in parts], "provenance": provenance},
         "splits": splits,
     })
-    for part in parts:
-        part.unlink()
     print(json.dumps(counts), flush=True)
 
 
@@ -356,7 +433,7 @@ def main():
     p.add_argument("--field", default="content")
     p.add_argument("--source-dir", help="Explicit repo directory of parquet shards")
     p.add_argument("--revision")
-    p.add_argument("--local", help="Local JSONL instead of HF")
+    p.add_argument("--local", help="Local JSONL instead of HF; makes `pack` fully offline")
     p.add_argument("--out", required=True)
     p.add_argument("--tokenizer")
     p.add_argument("--vocab-size", type=int, default=32768)
@@ -387,6 +464,8 @@ def main():
         pack(args)
     elif args.command == "merge":
         merge(args)
+    elif args.local:
+        pack_local(args)
     else:
         fast_pack(args)
 
